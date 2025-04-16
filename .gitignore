@@ -1,9 +1,11 @@
+# Python-generated files
 __pycache__/
-wandb/
-src/__pycache__/
-demo/
-fla/
-web/page/merge_page.py
-web/cache.yml
-*.Identifier
-/scripts-custom
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+/.idea

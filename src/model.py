@@ -13,6 +13,9 @@ if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
+import numpy as np # Added for validation
+from scipy.stats import wasserstein_distance # Added for validation
+
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
 except:
@@ -279,12 +282,13 @@ class RWKV(pl.LightningModule):
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
 
-        self.emb = nn.Embedding(args.vocab_size, args.n_embd)
+        self.input_projection = nn.Linear(64, args.n_embd) 
 
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
 
         self.ln_out = nn.LayerNorm(args.n_embd)
-        self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        # Output head now maps to 64 features for the soft label distribution
+        self.head = nn.Linear(args.n_embd, 64, bias=False) # Assuming 64 is the new target dimension
 
     def configure_optimizers(self):
         args = self.args
@@ -336,10 +340,10 @@ class RWKV(pl.LightningModule):
 
     def forward(self, idx):
         args = self.args
-        B, T = idx.size()
+        B, T, C_in = idx.size() # Input shape is now (B, T, 64)
+        assert C_in == 64, f"Input channel dimension C_in must be 64, got {C_in}"
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
-
-        x = self.emb(idx)
+        x = self.input_projection(idx) # New linear projection
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
@@ -349,14 +353,51 @@ class RWKV(pl.LightningModule):
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
-        x = self.head(x)
-        return x
+        raw_logits = self.head(x) # Output raw scores/logits for the 64 features
+        output_log_probs = F.log_softmax(raw_logits, dim=-1) # Convert to log-probabilities
+        
+        # Return raw_logits for L2Wrap and log_probs for KLDivLoss
+        return raw_logits, output_log_probs
 
     def training_step(self, batch, batch_idx):
-        idx, targets = batch
-        logits = self(idx)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return L2Wrap.apply(loss, logits)
+        # idx: (B, T, 64) FloatTensor - input soft labels (or pre-projected features)
+        # targets: (B, T, 64) FloatTensor - target soft labels (probability distribution)
+        idx, targets = batch 
+        
+        raw_logits, model_output_log_probs = self(idx)
+        
+        # targets are q_probs
+        # model_output_log_probs are log_p_probs
+        
+        log_p = model_output_log_probs 
+        p = torch.exp(log_p)
+        q = targets # targets are already probabilities
+
+        # Ensure q sums to 1 and is non-negative if not guaranteed by dataloader
+        # For stability, clamp inputs to log functions
+        epsilon = 1e-12 # Small epsilon for numerical stability
+
+        # Calculate M = 0.5 * (P + Q)
+        m = 0.5 * (p + q)
+        m_clamped = torch.clamp(m, min=epsilon)
+        log_m = torch.log(m_clamped)
+
+        # KL(P || M) = sum(P * (logP - logM))
+        # log_p is model_output_log_probs
+        kl_p_m_elementwise = p * (log_p - log_m)
+        kl_p_m = kl_p_m_elementwise.sum(dim=-1) # Sum over the 64 classes for each token
+
+        # KL(Q || M) = sum(Q * (logQ - logM))
+        q_clamped = torch.clamp(q, min=epsilon)
+        log_q_clamped = torch.log(q_clamped)
+        kl_q_m_elementwise = q * (log_q_clamped - log_m)
+        kl_q_m = kl_q_m_elementwise.sum(dim=-1) # Sum over the 64 classes for each token
+        
+        jsd_per_token = 0.5 * (kl_p_m + kl_q_m) # Shape: (B, T)
+        loss = jsd_per_token.mean() # Average over all B*T tokens
+
+        # Apply L2Wrap to the raw_logits before softmax, if L2Wrap is still desired
+        return L2Wrap.apply(loss, raw_logits)
 
     def training_step_end(self, batch_parts):
         all = self.all_gather(batch_parts)
@@ -386,24 +427,25 @@ class RWKV(pl.LightningModule):
             print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {s3.ljust(5)} {n}", end="")
 
             scale = 1.0
-            if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias') or (".weight" not in n):
+            if n == "input_projection.weight":
+                m[n] = p
+                init_val_range = 1e-4
+                nn.init.uniform_(m[n], a=-init_val_range, b=init_val_range)
+                print(f" [uniform init_range {init_val_range}]")
+            elif n == "input_projection.bias":
+                m[n] = p
+                nn.init.zeros_(m[n])
+                print(f" [zero init]")
+            elif "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias') or (".weight" not in n):
                 if 'ln_x.weight' in n:
                     layer_scale = (1+int(n.split('.')[1])) / self.args.n_layer
                     m[n] = (p * 0.0) + (layer_scale ** 0.7)
                 else:
                     m[n] = p
                 print()
-            elif n == "emb.weight":
-                m[n] = p
-                scale = -1e-4
-                nn.init.uniform_(m[n], a=scale, b=-scale)
-                print(f" [scale {scale}]")
             elif n == "head.weight":
                 m[n] = p
-                if self.args.vocab_size > self.args.n_embd:
-                    scale = 0.5 * math.sqrt(self.args.vocab_size / self.args.n_embd)
-                else:
-                    scale = 0.5
+                scale = 0.5
                 nn.init.orthogonal_(m[n], gain=scale)
                 print(f" [scale {scale}]")
             else:
@@ -447,3 +489,145 @@ class RWKV(pl.LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
         return m
+
+    def validation_step(self, batch, batch_idx):
+        data_input, targets_q_dist = batch
+        
+        # Ensure data is on the correct device
+        data_input = data_input.to(self.device)
+        targets_q_dist = targets_q_dist.to(self.device)
+
+        # Model forward pass - this will be under autocast if Trainer is configured
+        raw_logits, model_output_log_probs_p = self(data_input)
+        
+        # Ensure model outputs are float32 for stable metric calculation
+        if model_output_log_probs_p is not None and model_output_log_probs_p.dtype != torch.float32:
+            model_output_log_probs_p = model_output_log_probs_p.float()
+        # raw_logits might also need casting if its precision matters for some specific (future) metric
+        # For current metrics, model_output_log_probs_p is primary.
+
+        model_probs_p = torch.exp(model_output_log_probs_p)  # P
+
+        B, T, V = targets_q_dist.shape # V should be self.args.vocab_size (e.g. 64)
+        
+        # Reshape for metric calculation (per token)
+        p_dist = model_probs_p.reshape(-1, V)      # Shape: (B*T, V)
+        q_dist = targets_q_dist.reshape(-1, V)  # Shape: (B*T, V)
+        log_p_dist = model_output_log_probs_p.reshape(-1, V) # Shape: (B*T, V)
+
+        current_batch_tokens = p_dist.shape[0]
+        if current_batch_tokens == 0:
+            return None # Or a dict with zero tokens
+
+        epsilon = getattr(self.args, 'eval_epsilon', 1e-12) # Get epsilon from args or use default
+
+        # 1. JSD (Jensen-Shannon Divergence)
+        m_dist = 0.5 * (p_dist + q_dist)
+        m_clamped = torch.clamp(m_dist, min=epsilon)
+        log_m_clamped = torch.log(m_clamped)
+        
+        kl_p_m_elementwise = p_dist * (log_p_dist - log_m_clamped)
+        kl_p_m = kl_p_m_elementwise.sum(dim=-1)
+
+        q_clamped = torch.clamp(q_dist, min=epsilon)
+        log_q_clamped = torch.log(q_clamped)
+        kl_q_m_elementwise = q_dist * (log_q_clamped - log_m_clamped)
+        kl_q_m = kl_q_m_elementwise.sum(dim=-1)
+
+        jsd_batch_sum = (0.5 * (kl_p_m + kl_q_m)).sum().item()
+
+        # 2. KL Divergence: KL(Q || P) and KL(P || Q)
+        kl_q_p_batch_sum = (q_dist * (log_q_clamped - log_p_dist)).sum(dim=-1).sum().item()
+        kl_p_q_batch_sum = (p_dist * (log_p_dist - log_q_clamped)).sum(dim=-1).sum().item()
+
+        # 3. Top-k Accuracy (on hardened labels)
+        pred_class_hard = torch.argmax(p_dist, dim=-1)
+        target_class_hard = torch.argmax(q_dist, dim=-1)
+        
+        correct_top1_batch = (pred_class_hard == target_class_hard).sum().item()
+        
+        _, pred_top5_indices = torch.topk(p_dist, 5, dim=-1, largest=True, sorted=True)
+        correct_top5_batch = (pred_top5_indices == target_class_hard.unsqueeze(-1)).any(dim=-1).sum().item()
+
+        # 4. Cosine Similarity (per token)
+        cosine_sim_batch_sum = F.cosine_similarity(p_dist, q_dist, dim=-1, eps=epsilon).sum().item()
+
+        # 5. Hellinger Distance (per token)
+        sqrt_p = torch.sqrt(torch.clamp(p_dist, min=0))
+        sqrt_q = torch.sqrt(torch.clamp(q_dist, min=0))
+        hellinger_dist_batch_sum = ((1.0 / math.sqrt(2.0)) * torch.norm(sqrt_p - sqrt_q, p=2, dim=-1)).sum().item()
+        
+        # 6. Wasserstein Distance (per token) - on CPU
+        wasserstein_dist_batch_sum = 0.0
+        if V > 0 : # Only if vocab size > 0
+            category_indices_np = np.arange(V)
+            p_dist_np = p_dist.cpu().numpy()
+            q_dist_np = q_dist.cpu().numpy()
+            for i in range(current_batch_tokens):
+                dist = wasserstein_distance(category_indices_np, category_indices_np,
+                                            p_dist_np[i], q_dist_np[i])
+                wasserstein_dist_batch_sum += dist
+        
+        return {
+            "val_jsd_sum": jsd_batch_sum,
+            "val_kl_q_p_sum": kl_q_p_batch_sum,
+            "val_kl_p_q_sum": kl_p_q_batch_sum,
+            "val_correct_top1": correct_top1_batch,
+            "val_correct_top5": correct_top5_batch,
+            "val_cosine_sim_sum": cosine_sim_batch_sum,
+            "val_hellinger_dist_sum": hellinger_dist_batch_sum,
+            "val_wasserstein_dist_sum": wasserstein_dist_batch_sum,
+            "val_tokens": current_batch_tokens
+        }
+
+    def validation_epoch_end(self, outputs):
+        if not outputs:
+            return
+
+        total_tokens_evaluated = sum(x["val_tokens"] for x in outputs if x is not None)
+        if total_tokens_evaluated == 0:
+            rank_zero_info("Validation: No tokens evaluated.")
+            # Log default/NaN values to prevent W&B errors if columns are expected
+            self.log("val_avg_jsd", float('inf'), sync_dist=True)
+            self.log("val_ppl_jsd", float('inf'), sync_dist=True)
+            self.log("val_avg_kl_q_p", float('inf'), sync_dist=True)
+            self.log("val_avg_kl_p_q", float('inf'), sync_dist=True)
+            self.log("val_acc_top1", 0.0, sync_dist=True)
+            self.log("val_acc_top5", 0.0, sync_dist=True)
+            self.log("val_avg_cosine_sim", 0.0, sync_dist=True)
+            self.log("val_avg_hellinger_dist", float('inf'), sync_dist=True)
+            self.log("val_avg_wasserstein_dist", float('nan'), sync_dist=True)
+            return
+
+        total_jsd_loss = sum(x["val_jsd_sum"] for x in outputs if x is not None)
+        total_kl_q_p_loss = sum(x["val_kl_q_p_sum"] for x in outputs if x is not None)
+        total_kl_p_q_loss = sum(x["val_kl_p_q_sum"] for x in outputs if x is not None)
+        correct_top1 = sum(x["val_correct_top1"] for x in outputs if x is not None)
+        correct_top5 = sum(x["val_correct_top5"] for x in outputs if x is not None)
+        
+        total_cosine_sim = sum(x["val_cosine_sim_sum"] for x in outputs if x is not None)
+        total_hellinger_dist = sum(x["val_hellinger_dist_sum"] for x in outputs if x is not None)
+        total_wasserstein_dist = sum(x["val_wasserstein_dist_sum"] for x in outputs if x is not None)
+
+        avg_jsd = total_jsd_loss / total_tokens_evaluated
+        ppl_jsd = math.exp(avg_jsd) if avg_jsd != float('inf') else float('inf')
+        avg_kl_q_p = total_kl_q_p_loss / total_tokens_evaluated
+        avg_kl_p_q = total_kl_p_q_loss / total_tokens_evaluated
+        acc_top1 = correct_top1 / total_tokens_evaluated
+        acc_top5 = correct_top5 / total_tokens_evaluated
+        avg_cosine_sim = total_cosine_sim / total_tokens_evaluated
+        avg_hellinger_dist = total_hellinger_dist / total_tokens_evaluated
+        avg_wasserstein_dist = total_wasserstein_dist / total_tokens_evaluated
+
+        self.log("val_avg_jsd", avg_jsd, sync_dist=True)
+        self.log("val_ppl_jsd", ppl_jsd, sync_dist=True)
+        self.log("val_avg_kl_q_p", avg_kl_q_p, sync_dist=True)
+        self.log("val_avg_kl_p_q", avg_kl_p_q, sync_dist=True)
+        self.log("val_acc_top1", acc_top1, sync_dist=True)
+        self.log("val_acc_top5", acc_top5, sync_dist=True)
+        self.log("val_avg_cosine_sim", avg_cosine_sim, sync_dist=True)
+        self.log("val_avg_hellinger_dist", avg_hellinger_dist, sync_dist=True)
+        self.log("val_avg_wasserstein_dist", avg_wasserstein_dist, sync_dist=True)
+        self.log("val_total_tokens", float(total_tokens_evaluated), sync_dist=True)
+
+        rank_zero_info(f"Validation Results: Avg JSD: {avg_jsd:.6f}, PPL (JSD): {ppl_jsd:.4f}, Top-1 Acc: {acc_top1:.4f}")

@@ -11,8 +11,8 @@
 #
 MODEL_TYPE="x070" # x060 => rwkv-6.0
 #
-N_LAYER="12"
-N_EMBD="768"
+N_LAYER="24"
+N_EMBD="1024"
 #
 CTX_LEN="4096" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
@@ -25,10 +25,10 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 # Larger model => use smaller LR
 # Finetuning => use very small LR, such as 1e-5
 #
-M_BSZ="252" # takes ~9G VRAM here => reduce this to save VRAM, increase this for faster speed
+M_BSZ="168" # takes ~9G VRAM here => reduce this to save VRAM, increase this for faster speed
 LR_INIT="6e-4"
 LR_FINAL="1e-5"
-GRAD_CP=0 # 1 => slower, save VRAM; 0 => faster, more VRAM
+GRAD_CP=1 # 1 => slower, save VRAM; 0 => faster, more VRAM
 EPOCH_SAVE=1 # save every 10 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens) => decrease if your GPU is weak
 #
 #######################################################################################################################
@@ -37,19 +37,19 @@ EPOCH_SAVE=1 # save every 10 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens)
 # use https://www.dcode.fr/prime-numbers-search
 #
 N_NODE=1 # number of nodes
-GPU_PER_NODE=1 # number of GPUs per node
+GPU_PER_NODE=4 # number of GPUs per node
 #
 DS_BUCKET_MB=200 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage)
 #
-source /public/home/ssjxzkz/Projects/rhineai/.venv/bin/activate
-cd /public/home/ssjxzkz/Projects/rhineai/src_py
-export PYTHONPATH="/public/home/ssjxzkz/Projects/rhineai/src_py:$PYTHONPATH"
+source /public/home/ssjxzkz/Projects/rwkv-cc/.venv/bin/activate
+cd /public/home/ssjxzkz/Projects/rwkv-cc
+export PYTHONPATH="/public/home/ssjxzkz/Projects/rwkv-cc:$PYTHONPATH"
 export WANDB_MODE=offline
-export CUDA_LAUNCH_BLOCKING=1
-python /public/home/ssjxzkz/Projects/rhineai/src_py/train.py --load_model "0" --wandb "rhineai" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+
+python /public/home/ssjxzkz/Projects/rwkv-cc/run/train.py --load_model "/public/home/ssjxzkz/Projects/rwkv-cc/out/L24-D1024-x070/rwkv-init.pth" --wandb "rhineai" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
- --data_file "/public/home/ssjxzkz/Projects/rhineai/data/target/datasets" --my_exit_tokens 28351775625 --magic_prime 6921791 \
+ --data_file "/public/home/ssjxzkz/Datasets/prot/ncbi_nr/mmap/softlabel" --my_exit_tokens 39395390490 --magic_prime 9617999 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD \
- --lr_init $LR_INIT --lr_final $LR_FINAL --warmup_steps 10 --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 --data_type "binidx" --vocab_size 65536 \
+ --lr_init $LR_INIT --lr_final $LR_FINAL --warmup_steps 10 --beta1 0.9 --beta2 0.99 --adam_eps 1e-18 --data_type "binidx" --vocab_size 65 \
  --weight_decay 0.001 --epoch_save $EPOCH_SAVE --head_size 64 \
  --accelerator gpu --devices $GPU_PER_NODE --precision bf16 --strategy deepspeed_stage_2 --grad_cp $GRAD_CP --enable_progress_bar True --ds_bucket_mb $DS_BUCKET_MB

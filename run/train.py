@@ -55,6 +55,10 @@ if __name__ == "__main__":
     parser.add_argument("--my_testing", default='x070', type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
 
+    # Arguments for Validation
+    parser.add_argument("--val_every_n_epoch", default=1, type=int, help="Run validation every N training epochs (uses the training dataloader).")
+    parser.add_argument("--eval_epsilon", default=1e-12, type=float, help="Epsilon for numerical stability in evaluation metrics (JSD, KL, etc.).")
+
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
@@ -67,6 +71,8 @@ if __name__ == "__main__":
     if "deepspeed" in args.strategy:
         import deepspeed
     from pytorch_lightning import seed_everything
+    # Import WandbLogger explicitly to ensure PTL recognizes it
+    from pytorch_lightning.loggers import WandbLogger
 
     if args.random_seed >= 0:
         print(f"########## WARNING: GLOBAL SEED {args.random_seed} THIS WILL AFFECT MULTIGPU SAMPLING ##########\n" * 3)
@@ -80,7 +86,7 @@ if __name__ == "__main__":
     args.my_timestamp = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     args.enable_checkpointing = False
     args.replace_sampler_ddp = False
-    args.logger = False
+    # args.logger = False # REMOVED/COMMENTED OUT to enable PTL loggers
     args.gradient_clip_val = args.grad_clip
     args.num_sanity_val_steps = 0
     args.check_val_every_n_epoch = int(1e20)
@@ -172,6 +178,10 @@ if __name__ == "__main__":
     if args.precision == "fp16":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
 
+    # Add eval_epsilon to args if not present, for RWKV.validation_step
+    if not hasattr(args, 'eval_epsilon'):
+        args.eval_epsilon = 1e-12 # Default if not parsed (e.g. if script is run with older arg set)
+
     os.environ["RWKV_JIT_ON"] = "1"
     if "deepspeed_stage_3" in args.strategy:
         os.environ["RWKV_JIT_ON"] = "0" # somehow incompatible
@@ -235,10 +245,37 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
+    # Removed separate validation dataloader creation logic based on user request
+    # We will use the training dataloader for validation if validation is enabled.
+    val_dataloader = None # Initialize as None, will be set to data_loader if validation is active
+
+    # PTL Trainer will automatically use WandbLogger if `wandb` arg is set
+    # and WandbLogger is available and `args.logger` is not False.
+    # We need to manually instantiate the logger and pass it to Trainer if we want
+    # more control or if PTL auto-detection is not sufficient in this setup.
+    # Given `args.wandb` exists, PTL should auto-detect and use WandbLogger.
+    # Let's rely on PTL's auto-detection based on the `wandb` argument.
+    # If auto-detection doesn't work, we might need to instantiate it manually here.
+
+    # Determine if validation should be enabled and set val_dataloader accordingly
+    if args.val_every_n_epoch > 0 and hasattr(args, 'val_batches') and args.val_batches > 0:
+        rank_zero_info(f"########## Validation Enabled ##########")
+        rank_zero_info(f"Using training dataloader for validation. Will check every {args.val_every_n_epoch} epoch(s) on {args.val_batches} batches.")
+        val_dataloader = data_loader # Use training dataloader for validation
+    else:
+        rank_zero_info("Validation disabled (--val_every_n_epoch <= 0 or --val_batches <= 0).")
+
     trainer = Trainer.from_argparse_args(
         args,
         callbacks=[train_callback(args)],
+        limit_val_batches=args.val_batches if val_dataloader is not None else 0, # Limit validation batches if validation is enabled
+        check_val_every_n_epoch=args.val_every_n_epoch if val_dataloader is not None else int(1e20),
+        # logger=WandbLogger(project=args.wandb, name=args.run_name + " " + args.my_timestamp, log_model=False) if args.wandb else None # Manual logger instantiation alternative
     )
+
+    # Configure Trainer for validation (Simplified check as limit_val_batches/check_val_every_n_epoch are now set in Trainer args)
+    # The check below is redundant now that limit_val_batches and check_val_every_n_epoch are set during Trainer instantiation based on val_dataloader being None or not.
+    # Removing this redundant block.
 
     if trainer.global_rank == 0:
         for n in model.state_dict():
@@ -256,4 +293,6 @@ if __name__ == "__main__":
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
 
-    trainer.fit(model, data_loader)
+    # Pass the training dataloader for training and also use it for validation
+    # Trainer will handle whether to run validation based on limit_val_batches and check_val_every_n_epoch
+    trainer.fit(model, train_dataloaders=data_loader, val_dataloaders=val_dataloader)
